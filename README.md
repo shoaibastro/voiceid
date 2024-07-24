@@ -1,4 +1,5 @@
 VoiceID: Spammer identification through Voice
+This project is copied from https://github.com/MShoaibRao/voiceid . all rights are reserved to https://github.com/MShoaibRao
 
 Install & run
 Use yarn or npm to install the dependencies, and the start script to start a local web server hosting the demo.
