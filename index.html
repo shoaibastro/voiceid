@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+  
+  <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VoiceID:Spamper Identification</title>
+    <link rel="icon" href="favi.svg" type="image/svg+xml">
+    
+    <script src="node_modules/@picovoice/web-voice-processor/dist/iife/index.js"></script>
+    <script src="node_modules/@picovoice/eagle-web/dist/iife/index.js"></script>
+    <script src="eagle_params.js"></script>
+    <script type="application/javascript">
+      let profiler = null;
+      let eagle = null;
+      let speakerProfiles = []
+
+      let timer = null;
+      let currentTimer = 0.0;
+      let audioData = [];
+      let audioContext = null;
+
+      const ENABLE_AUDIO_DUMP = false;
+      let dumpAudio = [];
+
+      window.onload = function () {
+        audioContext = new (window.AudioContext || window.webKitAudioContext)(
+                { sampleRate: 16000 }
+        );
+
+        document.getElementById("audioFile").addEventListener("change", async (event) => {
+          newEnrollmentUI();
+          try {
+            await profiler.reset();
+          } catch (e) {
+            writeMessage(`Failed to reset Voice Profiler. Error: ${e}`);
+            return;
+          }
+
+          writeMessage("Processing audio files...");
+          const fileList = event.target.files;
+          let percentage = 0;
+          for (const f of fileList) {
+            let audioFrame;
+            try {
+              audioFrame = await getAudioFileData(f, audioContext);
+            } catch (e) {
+              writeMessage(`Failed to read audio file '${f.name}'. Error: ${e}`);
+              return;
+            }
+
+            try {
+              const result = await profiler.enroll(audioFrame);
+              updateSpeakerProgress(speakerProfiles.length + 1, result.feedback, result.percentage)
+              percentage = result.percentage;
+            } catch (e) {
+              writeMessage(`Failed to enroll using '${f.name}'. Error: ${e}`);
+              return;
+            }
+          }
+
+          if (percentage < 100) {
+            writeMessage(`Speaker is only ${percentage}% done enrollment. ` +
+                    `Please choose a larger data set and try again.`);
+            enrollFailUI();
+            return;
+          }
+
+          try {
+            const profile = await profiler.export();
+            speakerProfiles.push(profile);
+            enrollSuccessUI();
+            writeMessage(`Enrollment for Speaker ${speakerProfiles.length} complete! ` +
+                    `You can begin testing or enroll another speaker.`);
+          } catch (e) {
+            writeMessage(`Failed to enroll speaker. Error: ${e}`);
+          }
+        });
+      }
+
+      async function getAudioFileData(audioFile, audioContext) {
+        const dataBuffer = await audioFile.arrayBuffer();
+        const audioBuffer = await audioContext.decodeAudioData(dataBuffer);
+
+        const f32PCM = audioBuffer.getChannelData(0);
+        const i16PCM = new Int16Array(f32PCM.length);
+
+        const INT16_MAX = 32767;
+        const INT16_MIN = -32768;
+        i16PCM.set(
+                f32PCM.map((f) => {
+                  let i = Math.trunc(f * INT16_MAX);
+                  if (f > INT16_MAX) i = INT16_MAX;
+                  if (f < INT16_MIN) i = INT16_MIN;
+                  return i;
+                })
+        );
+        return i16PCM;
+      }
+
+      const micEnrollEngine = {
+        onmessage: async (event) => {
+          switch (event.data.command) {
+            case "process":
+              audioData.push(event.data.inputFrame);
+
+              if (ENABLE_AUDIO_DUMP) {
+                dumpAudio = dumpAudio.concat(event.data.inputFrame);
+              }
+
+              if (audioData.length * 512 >= profiler.minEnrollSamples) {
+                let result;
+
+                try {
+                  const frames = new Int16Array(audioData.length * 512);
+                  for (let i = 0; i < audioData.length; i++) {
+                    frames.set(audioData[i], i * 512);
+                  }
+                  audioData = [];
+                  result = await profiler.enroll(frames);
+                } catch (e) {
+                  writeMessage(`Failed to enroll. Error: ${e}`);
+                  return;
+                }
+
+                updateSpeakerProgress(speakerProfiles.length + 1, result.feedback, result.percentage);
+                if (result.percentage === 100) {
+                  await window.WebVoiceProcessor.WebVoiceProcessor.unsubscribe(micEnrollEngine);
+                  clearInterval(timer);
+                  micEnrollStopUI();
+
+                  try {
+                    const profile = await profiler.export();
+                    speakerProfiles.push(profile);
+                    enrollSuccessUI();
+                    writeMessage(`Enrollment for Speaker ${speakerProfiles.length} complete! ` +
+                            `You can begin testing or enroll another speaker.`);
+                  } catch (e) {
+                    writeMessage(`Failed to enroll speaker. Error: ${e}`);
+                  }
+
+                  if (ENABLE_AUDIO_DUMP) {
+                    downloadDumpAudio("enroll.pcm");
+                  }
+                }
+              }
+              break;
+          }
+        }
+      }
+
+      async function micEnrollStart() {
+        currentTimer = 0.0;
+        audioData = [];
+        micEnrollStartUI();
+        newEnrollmentUI();
+        try {
+          await profiler.reset();
+        } catch (e) {
+          writeMessage(`Failed to reset Voice Profiler. Error: ${e}`);
+          return;
+        }
+
+        writeMessage("Keep speaking continuously until enrollment progress reaches 100%.");
+        try {
+          await window.WebVoiceProcessor.WebVoiceProcessor.subscribe(micEnrollEngine);
+          timer = setInterval(() => {
+            currentTimer += 0.1;
+            document.getElementById("displayTimer").innerText = `${currentTimer.toFixed(1)}`;
+          }, 100);
+        } catch (e) {
+          writeMessage(e);
+        }
+      }
+
+      async function micEnrollStop() {
+        await window.WebVoiceProcessor.WebVoiceProcessor.unsubscribe(micEnrollEngine);
+        clearInterval(timer);
+        writeMessage(`Enrollment stopped`);
+        updateSpeakerTable();
+        enrollFailUI();
+        micEnrollStopUI();
+      }
+
+      function writeMessage(message) {
+        console.log(message);
+        document.getElementById("status").innerHTML = message;
+      }
+
+      function updateSpeakerProgress(speakerId, feedback, progress) {
+        const feedbackMsg = getFeedbackMessage(feedback)
+        console.log(progress, feedbackMsg);
+        document.getElementById(`speaker${speakerId}Feedback`).innerHTML = ` ${feedbackMsg}`;
+        document.getElementById(`speaker${speakerId}Progress`).value = progress;
+      }
+
+      function updateSpeakerScore(speakerId, score) {
+        document.getElementById(`speaker${speakerId}Progress`).value = score * 100;
+      }
+
+      function getFeedbackMessage(feedback) {
+        switch (feedback) {
+          case EagleWeb.EagleProfilerEnrollFeedback.AUDIO_TOO_SHORT:
+            return "Insufficient audio length";
+          case EagleWeb.EagleProfilerEnrollFeedback.UNKNOWN_SPEAKER:
+            return "Different speaker detected in audio";
+          case EagleWeb.EagleProfilerEnrollFeedback.NO_VOICE_FOUND:
+            return "Unable to detect voice in audio";
+          case EagleWeb.EagleProfilerEnrollFeedback.QUALITY_ISSUE:
+            return "Audio quality too low to use for enrollment";
+          default:
+            return "Enrolling speaker...";
+        }
+      }
+
+      function updateSpeakerTable() {
+        const speakerTable = document.getElementById("speakersTable");
+        while (speakerTable.lastElementChild) {
+          speakerTable.removeChild(speakerTable.lastElementChild);
+        }
+        for (let i = 0; i < speakerProfiles.length; i++) {
+          speakerTable.append(createSpeakerRow(i + 1, 100));
+          speakerTable.append(document.createElement("br"))
+        }
+      }
+
+      function createSpeakerRow(i, initialProgress) {
+        const div = document.createElement("div");
+        div.textContent = `Speaker ${i} `
+        const speakerProgress = document.createElement("progress");
+        speakerProgress.max = 100;
+        speakerProgress.value = initialProgress;
+        speakerProgress.id = `speaker${i}Progress`
+        const speakerFeedback = document.createElement("span");
+        speakerFeedback.id = `speaker${i}Feedback`
+        div.appendChild(speakerProgress);
+        div.appendChild(speakerFeedback);
+        return div;
+      }
+
+      function newEnrollmentUI() {
+        updateSpeakerTable();
+        document.getElementById("testContainer").style.display = "block";
+        document.getElementById("feedbackText").innerHTML = "";
+        document.getElementById("speakersTable").append(createSpeakerRow(speakerProfiles.length + 1, 0));
+        document.getElementById("speakersTable").append(document.createElement("br"))
+        document.getElementById("testStartBtn").disabled = true;
+        document.getElementById("resetBtn").disabled = true;
+      }
+
+      function enrollFailUI() {
+        document.getElementById("testStartBtn").disabled = speakerProfiles.length === 0;
+        document.getElementById("resetBtn").disabled = speakerProfiles.length === 0;
+      }
+
+      function enrollSuccessUI() {
+        updateSpeakerTable();
+        document.getElementById("testStartBtn").disabled = false;
+        document.getElementById("resetBtn").disabled = false;
+      }
+
+      function micEnrollStartUI() {
+        document.getElementById("displayTimer").style.display = "inline";
+        document.getElementById("micEnrollStartBtn").style.display = "none";
+        document.getElementById("audioFile").disabled = true;
+        document.getElementById("micEnrollStopBtn").style.display = "inline";
+      }
+
+      function micEnrollStopUI() {
+        document.getElementById("displayTimer").style.display = "none";
+        document.getElementById("micEnrollStartBtn").style.display = "inline";
+        document.getElementById("audioFile").disabled = false;
+        document.getElementById("micEnrollStopBtn").style.display = "none";
+        document.getElementById("displayTimer").innerText = `0.0`;
+      }
+
+      function micTestStartUI() {
+        document.getElementById("micEnrollStartBtn").disabled = true;
+        document.getElementById("audioFile").disabled = true;
+        document.getElementById("resetBtn").disabled = true;
+        document.getElementById("testStartBtn").style.display = "none";
+        document.getElementById("testStopBtn").style.display = "inline";
+        document.getElementById("testStopBtn").disabled = true;
+      }
+
+      function micTestStopUI() {
+        document.getElementById("micEnrollStartBtn").disabled = false;
+        document.getElementById("audioFile").disabled = false;
+        document.getElementById("resetBtn").disabled = false;
+        document.getElementById("testStartBtn").style.display = "inline";
+        document.getElementById("testStopBtn").style.display = "none";
+      }
+
+      async function startEagleProfiler(accessKey) {
+        writeMessage("VoiceID is loading. Please wait...");
+        try {
+          profiler = await EagleWeb.EagleProfilerWorker.create(
+                  accessKey,
+                  {
+                    base64: modelParams,
+                    forceWrite: true
+                  });
+          writeMessage("");
+
+          document.getElementById('enrollContainer').style.display = "block";
+        } catch (e) {
+          writeMessage(`Failed to initialize VoiceID. Error: ${e}`);
+        }
+      }
+
+      const micTestEngine = {
+        onmessage: async (event) => {
+          switch (event.data.command) {
+            case "process":
+              if (ENABLE_AUDIO_DUMP) {
+                dumpAudio = dumpAudio.concat(event.data.inputFrame);
+              }
+              let scores
+              try {
+                scores = await eagle.process(event.data.inputFrame);
+              } catch (e) {
+                writeMessage(`Failed to enroll. Error: ${e}`);
+                return;
+              }
+
+              for (let i = 0; i < scores.length; i++) {
+                updateSpeakerScore(i + 1, scores[i]);
+              }
+              break;
+          }
+        }
+      }
+
+      async function startEagle(accessKey) {
+        writeMessage("VoiceID is loading. Please wait...");
+        micTestStartUI();
+        try {
+          eagle = await EagleWeb.EagleWorker.create(
+                  accessKey,
+                  {
+                    base64: modelParams,
+                    forceWrite: true
+                  },
+                  speakerProfiles);
+
+        } catch (e) {
+          writeMessage(`Failed to initialize SpeakerScan. Error: ${e}`);
+          return;
+        }
+        try {
+          await profiler.reset();
+        } catch (e) {
+          writeMessage(`Failed to reset SpeakerScan Profiler. Error: ${e}`);
+          return;
+        }
+
+        document.getElementById("testStopBtn").disabled = false;
+        for (let i = 0; i < speakerProfiles.length; i++) {
+          updateSpeakerScore(i + 1, 0);
+        }
+        writeMessage("Take turns speaking sentences and see if VoiceID can recognize which speaker is talking");
+        try {
+          await window.WebVoiceProcessor.WebVoiceProcessor.subscribe(micTestEngine);
+        } catch (e) {
+          writeMessage(e);
+        }
+      }
+
+      async function stopEagle() {
+        try {
+          await window.WebVoiceProcessor.WebVoiceProcessor.unsubscribe(micTestEngine);
+        } catch (e) {
+          writeMessage(e);
+        }
+
+        if (eagle) {
+          await eagle.terminate();
+          eagle = null;
+        }
+        for (let i = 0; i < speakerProfiles.length; i++) {
+          updateSpeakerScore(i + 1, 100);
+        }
+        micTestStopUI();
+        writeMessage("");
+
+        if (ENABLE_AUDIO_DUMP) {
+          downloadDumpAudio('test.pcm');
+        }
+      }
+
+      function resetSpeakers() {
+        document.getElementById("testContainer").style.display = "none";
+        speakerProfiles = [];
+        updateSpeakerTable();
+        writeMessage("");
+      }
+
+      function downloadDumpAudio(fileName) {
+        let blob = new Blob(dumpAudio);
+        dumpAudio = [];
+        let a = document.createElement('a');
+        a.download = fileName;
+        a.href = window.URL.createObjectURL(blob);
+        a.click();
+        document.removeChild(a);
+      }
+    </script>
+  </head>
+  
+  
+  
+  
+  
+  
+  
+  
+  <body style="
+  display: flex; 
+  flex-direction: column; 
+  align-items: center; 
+  justify-content: center; 
+  background-image: url('v6.jpg'); 
+  background-size: 100%; 
+  background-position: center;
+  min-height: 100vh; 
+   margin: 0;
+   padding:0;
+  font-family: Arial, sans-serif;
+">
+
+  <h1 id="animatedText" style="
+        color: white; 
+        text-align: center; 
+        font-family: Arial, sans-serif; 
+        font-size: 2.5em; 
+        padding-top: 0px;
+        padding-bottom: 200px
+        margin: 0px;
+        text-shadow: 0 0 10px rgba(74,144,226,0.7), 0 0 20px rgba(74,144,226,0.5);
+        position: relative;
+        overflow: hidden;
+        white-space: nowrap;
+        display: inline-block;
+        animation: textMove 3s linear infinite;
+    ">VoiceID</h1>
+
+  
+
+  <div style="
+    background: rgba(255, 255, 255, 0.3); 
+    padding: 70px; 
+    border-radius: 20px; 
+    border: 2px solid #979A9A; 
+    box-shadow: 0 0 15px rgba(74,144,226,0.5), 0 0 30px rgba(74,144,226,0.3); 
+    backdrop-filter: blur(3px);
+    overflow: hidden;
+    color: white; /* Sets the text color to white */
+    max-width: 90%; /* Ensures the box doesn't stretch too wide */
+    width: 600px; /* Fixed width for the box */
+    min-width: 80%;
+    height: auto; /* Allows height to adjust based on content */
+    margin: 0 auto; /* Centers the div horizontally */
+    position: relative; /* For positioning the pseudo-element */
+    transition: border 0.3s ease, box-shadow 0.3s ease; /* Smooth transition for border and shadow */
+" onmouseover="this.style.border='2px solid #00D084'; this.style.boxShadow='0 0 20px rgba(0,208,132,0.7), 0 0 40px rgba(0,208,132,0.5)';" onmouseout="this.style.border='2px solid #979A9A'; this.style.boxShadow='0 0 15px rgba(74,144,226,0.5), 0 0 30px rgba(74,144,226,0.3)';">
+    
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+    <p style="
+    font-size: 1.2em; 
+    color: white; 
+    margin-bottom: 10px;
+    font-weight: bold;
+  ">
+    The Features of this project are:
+  </p>
+  
+  <ol style="
+    padding-left: 20px; 
+    margin: 0; 
+    font-size: 1.1em; 
+    color: white;
+  ">
+    <li style="
+      margin-bottom: 10px;
+      line-height: 1.6;
+    ">
+      Select an audio file or acquire microphone data stream and convert to voice processing format.
+    </li>
+    <li style="
+      margin-bottom: 10px;
+      line-height: 1.6;
+    ">
+      Enroll multiple speakers with audio files or a microphone.
+    </li>
+    <li style="
+      margin-bottom: 10px;
+      line-height: 1.6;
+    ">
+      Recognize which speaker is talking in real-time.
+    </li>
+  </ol>
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    After entering the AccessKey, click the "Start" button.
+ 
+    <hr />
+    
+    <input type="text" id="accessKey" name="accessKey" style="
+  padding: 10px; 
+  border: 2px solid #4A90E2; 
+  border-radius: 5px; 
+  background: rgba(255, 255, 255, 0.3);
+  font-size: 1em; 
+  width: 70%; 
+  max-width: 300px; 
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  margin-bottom: 10px;
+  box-sizing: border-box;
+" value="H0fDZdgA3/bx43l+lg+y5ZVBT1vwRZt8X2lgNHVzQpl7yDhtnBsbTA==" />
+
+<script>
+  document.getElementById('accessKey').style.display = 'none';
+</script>
+<input 
+  type="button"
+  id="submit"
+  value="--Start--"
+  onclick="startEagleProfiler(document.getElementById('accessKey').value)"
+  style="
+    background-color: #4A90E2; 
+    color: white; 
+    width: 100%;
+    border: none; 
+    border-radius: 5px; 
+    padding: 10px 20px; 
+    font-size: 1em; 
+    cursor: pointer; 
+    box-shadow: 0 4px 8px rgba(0,0,0,0.2); 
+    transition: background-color 0.3s ease;
+  "
+/>
+
+<script>
+  // Adding hover effect for the button using JS to avoid inline CSS
+  document.getElementById('submit').addEventListener('mouseover', function() {
+    this.style.backgroundColor = '#357ABD';
+  });
+  document.getElementById('submit').addEventListener('mouseout', function() {
+    this.style.backgroundColor = '#4A90E2';
+  });
+</script>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    <hr/>
+    
+    
+    <div id="enrollContainer" style="display: none">
+      <label for="audioFile"; font-weight: bold; >Enroll speaker with one or more audio files:</label>
+      <input
+  type="file"
+  id="audioFile"
+  name="audioFile"
+  accept="audio/*,.wav"
+  multiple
+  style="
+    display: block; 
+    padding: 2px; 
+    border: 1px solid #4A90E2; 
+    border-radius: 1px; 
+    background: rgba(255, 255, 255, 0.3);
+    font-size: 1em; 
+    width: 100%; 
+    max-width: 200px; 
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
+    margin-bottom: 20px; 
+    box-sizing: border-box;
+    cursor: pointer;
+  "
+/>
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+      <p><b>OR</b></p>
+      
+      
+      
+      
+      <label for="micEnrollStartBtn">Enroll speaker with microphone:</label>
+      
+      
+      <button id="micEnrollStartBtn" onclick="micEnrollStart()" 
+      style="
+    background-color: #4A90E2; 
+    color: white; 
+    border: none; 
+    border-radius: 5px; 
+    padding: 10px 20px; 
+    font-size: 1em; 
+    cursor: pointer; 
+    box-shadow: 0 4px 8px rgba(0,0,0,0.2); 
+    transition: background-color 0.3s ease;
+  ">Record Audio</button>
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      <button id="micEnrollStopBtn" onclick="micEnrollStop()" style="display: none">Stop Enrollment</button>
+      <span id="displayTimer" style="display: none;"></span>
+      <br />
+      <hr/>
+    </div>
+    <div id="testContainer" style="display: none">
+      <div>
+        <button
+          id="testStartBtn"
+          onclick="startEagle(document.getElementById('accessKey').value)"
+          style="
+    background-color: #4A90E2; 
+    color: white; 
+    border: none; 
+    border-radius: 5px; 
+    padding: 10px 20px; 
+    font-size: 1em; 
+    cursor: pointer; 
+    box-shadow: 0 4px 8px rgba(0,0,0,0.2); 
+    transition: background-color 0.3s ease;
+  "
+          >
+          Start Test
+        </button>
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        <button
+          id="testStopBtn"
+          onclick="stopEagle()"
+          style="display: none"
+          >
+          Stop Test
+        </button>
+        <button
+            id="resetBtn"
+            onclick="resetSpeakers()"
+            style="
+    background-color: #4A90E2; 
+    color: white; 
+    border: none; 
+    border-radius: 5px; 
+    padding: 10px 20px; 
+    font-size: 1em; 
+    cursor: pointer; 
+    box-shadow: 0 4px 8px rgba(0,0,0,0.2); 
+    transition: background-color 0.3s ease;
+  "
+            >
+          Reset
+        </button>
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        <span id="feedbackText"></span>
+      </div>
+      
+      
+    </p>
+      
+      
+      
+      <br />
+      <div id="speakersTable">
+      </div>
+      <hr />
+    </div>
+    <div id="status"></div>
+    
+    </div>
+    <style>
+    @keyframes textMove {
+      0% {
+        transform: perspective(500px) rotateX(0deg) rotateY(0deg);
+      }
+      50% {
+        transform: perspective(500px) rotateX(10deg) rotateY(10deg);
+      }
+      100% {
+        transform: perspective(500px) rotateX(0deg) rotateY(0deg);
+      }
+    }
+    
+    
+    
+    .text-container {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        white-space: nowrap;
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .text-container span {
+        display: inline-block;
+        animation: textMove 3s linear infinite;
+    }
+
+    .typewriter {
+        border-right: 2px solid white;
+        white-space: nowrap;
+        overflow: hidden;
+        animation: typewriter 5s steps(40, end) 1s 1 normal both, blink 500ms steps(40, end) infinite;
+    }
+  </style>
+    <script>
+        const textElement = document.getElementById('animatedText');
+
+        function typewriterEffect(element, text, delay = 100, callback) {
+            let index = 0;
+            element.innerHTML = '';
+            function type() {
+                if (index < text.length) {
+                    element.innerHTML += text.charAt(index);
+                    index++;
+                    setTimeout(type, delay);
+                } else if (callback) {
+                    setTimeout(callback, delay);
+                }
+            }
+            type();
+        }
+
+        function startAnimation() {
+            setTimeout(() => {
+                typewriterEffect(textElement, 'Spamer Identification through Voice', 100, () => {
+                    setTimeout(() => {
+                        typewriterEffect(textElement, 'VoiceID', 100);
+                    }, 3000);
+                });
+            }, 4000);
+        }
+
+        startAnimation();
+        setInterval(startAnimation, 8000); // Repeat the animation every 8 seconds
+    </script>
+    
+    
+    
+    
+    
+    
+    
+
+
+
+<!--      ///////////////////////////////footer //////////////////// -->
+ <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <style>
+    
+    .footer-bottom-area {
+        background-color: #2a6b74c7;
+        width: 100%;
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        padding: 10px 0;
+    }
+    
+    .container {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 0 15px;
+    }
+    
+    .row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    
+    .copyright-text {
+        text-align: left;
+    }
+    
+    .footer-social-links {
+        list-style: none;
+        display: flex;
+        justify-content: flex-end;
+        padding: 0;
+        margin: 0;
+    }
+    
+    .footer-social-links li {
+        margin-left: 10px;
+    }
+    
+    .footer-social-links a {
+        color: #333;
+        text-decoration: none;
+    }
+    
+    .footer-social-links a:hover {
+        color: #007bff;
+    }
+div p{
+  color: white;
+}
+i{
+  color: white;
+}
+    div p a{
+        text-decoration: none;
+        color: #48cbf6;
+    }
+    </style>
+
+<section class="footer-bottom-area">
+    <div class="container">
+        <div class="row">
+            <div class="col-md-8">
+                <div class="copyright-text">
+                    <p>Copyright @ <span id="currentYear"></span> <a href="mailto: shoaib.tashrif@gmail.com" target="_blank">Shoaib Tashrif</a>, All Rights Reserved</p> 
+                </div>
+            </div>
+            <div class="col-md-4">
+                <ul class="footer-social-links">
+                    <li><a href="https://www.github.com/MShoaibRao" target="_blank"><i class="fab fa-github"></i></a></li>
+                    <li><a href="https://www.linkedin.com/in/shoaibtashrif" target="_blank"><i class="fab fa-linkedin"></i></a></li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</section>
+
+<script>
+    document.getElementById('currentYear').textContent = new Date().getFullYear();
+</script>
+
+
+
+
+
+
+
+
+
+
+<!--      ///////////////////////////////footer //////////////////// -->
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+    
+    
+    
+    
+    
+    
+    
+  </body>
+</html>
